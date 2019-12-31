@@ -20,7 +20,7 @@ import {
   type DirectiveLocationEnum,
 } from '../language/directiveLocation';
 
-import { GraphQLString, GraphQLBoolean } from './scalars';
+import { GraphQLString, GraphQLBoolean, GraphQLInt } from './scalars';
 import {
   type GraphQLFieldConfigArgumentMap,
   type GraphQLArgument,
@@ -191,6 +191,30 @@ export const GraphQLDeferDirective = new GraphQLDirective({
 });
 
 /**
+ * Used to conditionally defer fragments.
+ */
+export const GraphQLStreamDirective = new GraphQLDirective({
+  name: 'stream',
+  description:
+    'Directs the executor to stream list fields when the `if` argument is true.',
+  locations: [DirectiveLocation.FIELD],
+  args: {
+    if: {
+      type: GraphQLBoolean,
+      description: 'Stream when true.',
+    },
+    initial_count: {
+      type: GraphQLNonNull(GraphQLInt),
+      description: 'initial_count',
+    },
+    label: {
+      type: GraphQLNonNull(GraphQLString),
+      description: 'label',
+    },
+  },
+});
+
+/**
  * Constant string used for default reason for a deprecation.
  */
 export const DEFAULT_DEPRECATION_REASON = 'No longer supported';
@@ -219,6 +243,7 @@ export const specifiedDirectives = Object.freeze([
   GraphQLIncludeDirective,
   GraphQLSkipDirective,
   GraphQLDeferDirective,
+  GraphQLStreamDirective,
   GraphQLDeprecatedDirective,
 ]);
 

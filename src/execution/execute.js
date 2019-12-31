@@ -42,6 +42,7 @@ import {
   GraphQLIncludeDirective,
   GraphQLSkipDirective,
   GraphQLDeferDirective,
+  GraphQLStreamDirective,
 } from '../type/directives';
 import {
   type GraphQLObjectType,
@@ -197,7 +198,13 @@ class ResultResolver {
 
           resultsResolver[keyResultResolve] = result;
           if (result !== undefined) {
-            results[responseName] = result;
+            if (responseName) {
+              // defer directive
+              results[responseName] = result;
+            } else {
+              // stream directive
+              results = result;
+            }
             if (!containsPromise && isPromise(result)) {
               containsPromise = true;
             }
@@ -789,6 +796,20 @@ function getDeferDirectiveValues(
   }
 }
 
+function getStreamDirectiveValues(
+  exeContext: ExecutionContext,
+  node: FieldNode,
+): void | { [argument: string]: mixed, ... } {
+  const stream = getDirectiveValues(
+    GraphQLStreamDirective,
+    node,
+    exeContext.variableValues,
+  );
+  if (stream && stream.if !== false) {
+    return stream;
+  }
+}
+
 /**
  * Determines if a fragment is applicable to the given type.
  */
@@ -1109,6 +1130,27 @@ function completeValue(
   );
 }
 
+function getStreamInfo(exeContext, fieldNodes) {
+  const streamInfos: Array<{
+    label: string,
+    initial_count: number,
+  }> = [];
+  for (const node of fieldNodes) {
+    const lastStream = getStreamDirectiveValues(exeContext, node);
+    if (
+      lastStream &&
+      !streamInfos.some(info => info.label === lastStream.label)
+    ) {
+      // $FlowFixMe(>=0.90.0)
+      streamInfos.push({
+        label: lastStream.label,
+        initial_count: lastStream.initial_count,
+      });
+    }
+  }
+  return streamInfos;
+}
+
 /**
  * Complete a list value by completing each item in the list with the
  * inner type
@@ -1132,18 +1174,42 @@ function completeListValue(
   const itemType = returnType.ofType;
   let containsPromise = false;
   const completedResults = [];
+
+  const streamInfos = getStreamInfo(exeContext, fieldNodes);
   forEach((result: any), (item, index) => {
     // No need to modify the info object containing the path,
     // since from here on it is not ever accessed by resolver functions.
     const fieldPath = addPath(path, index);
-    const completedItem = completeValueCatchingError(
-      exeContext,
-      itemType,
-      fieldNodes,
-      info,
-      fieldPath,
-      item,
+    const toStreamInfos = streamInfos.filter(
+      info => info.initial_count <= index,
     );
+    const isStream = toStreamInfos.length > 0;
+    const every = isStream && toStreamInfos.length === fieldNodes.length;
+
+    const resolve = () =>
+      completeValueCatchingError(
+        exeContext,
+        itemType,
+        fieldNodes,
+        info,
+        fieldPath,
+        item,
+      );
+
+    const completedItem = !every ? resolve() : null;
+
+    for (const info of toStreamInfos) {
+      exeContext.resultResolver.addDeferResolver(
+        fieldPath,
+        info.label,
+        null,
+        () => (every ? resolve() : completedItem),
+      );
+    }
+
+    if (every) {
+      return;
+    }
 
     if (!containsPromise && isPromise(completedItem)) {
       containsPromise = true;
