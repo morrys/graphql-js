@@ -6,8 +6,86 @@ import { describe, it } from 'mocha';
 import { graphql } from '../graphql';
 
 import { StarWarsSchema as schema } from './starWarsSchema';
+import { forAwaitEach, isAsyncIterable } from 'iterall';
 
 describe('Star Wars Query Tests', () => {
+  it('Can @stream multiple selections on the same field', async () => {
+    const source = `
+        query HeroFriendsQuery {
+          hero {
+            friends {
+              id
+            }
+            ...FriendsName
+            ...FriendsAppearsIn
+          }
+        }
+        fragment FriendsName on Character {
+          friends @stream(label: "nameLabel", initial_count: 1, if: true) {
+            name
+          }
+        }
+        fragment FriendsAppearsIn on Character {
+          friends @stream(label: "appearsInLabel", initial_count: 2, if: true)  {
+            appearsIn
+          }
+        }
+      `;
+    const result = await graphql({ schema, source });
+
+    expect(isAsyncIterable(result)).to.equal(true);
+
+    const results = [];
+    await forAwaitEach(((result: any): AsyncIterable<mixed>), value => {
+      results.push(value);
+    });
+
+    expect(results[0]).to.deep.equal({
+      data: {
+        hero: {
+          friends: [
+            {
+              id: '1000',
+              appearsIn: ['NEW_HOPE', 'EMPIRE', 'JEDI'],
+              name: 'Luke Skywalker',
+            },
+            {
+              id: '1002',
+              appearsIn: ['NEW_HOPE', 'EMPIRE', 'JEDI'],
+            },
+            {
+              id: '1003',
+            },
+          ],
+        },
+      },
+    });
+
+    expect(results).to.have.lengthOf(4);
+    expect(results[1]).to.deep.equal({
+      data: {
+        name: 'Han Solo',
+      },
+      path: ['hero', 'friends', 1],
+      label: 'nameLabel',
+    });
+
+    expect(results[2]).to.deep.equal({
+      data: {
+        name: 'Leia Organa',
+      },
+      path: ['hero', 'friends', 2],
+      label: 'nameLabel',
+    });
+
+    expect(results[3]).to.deep.equal({
+      data: {
+        appearsIn: ['NEW_HOPE', 'EMPIRE', 'JEDI'],
+      },
+      path: ['hero', 'friends', 2],
+      label: 'appearsInLabel',
+    });
+  });
   describe('Basic Queries', () => {
     it('Correctly identifies R2-D2 as the hero of the Star Wars Saga', async () => {
       const source = `

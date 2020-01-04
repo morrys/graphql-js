@@ -65,6 +65,7 @@ import { typeFromAST } from '../utilities/typeFromAST';
 import { getOperationRootType } from '../utilities/getOperationRootType';
 
 import objectValues from '../polyfills/objectValues';
+import objectEntries from '../polyfills/objectEntries';
 
 import {
   getVariableValues,
@@ -147,7 +148,8 @@ export type ExecutionArgs = {|
  * PromiseOrValue <ExecutionResult> for standard executions
  */
 class ResultResolver {
-  executionResults: Array<Promise<AsyncExecutionResult>>;
+  initialResult: Promise<AsyncExecutionResult> | void;
+  executionResults: ObjMap<Promise<AsyncExecutionResult>>;
   deferResults: ObjMap<{|
     path: Array<string | number>,
     label: string,
@@ -155,80 +157,99 @@ class ResultResolver {
       responseName: string,
       resolver: () => PromiseOrValue<mixed>,
     |}>,
+    resolveResult?: () => PromiseOrValue<ObjMap<mixed> | null>,
   |}>;
 
   constructor() {
-    this.executionResults = [];
+    this.executionResults = Object.create(null);
     this.deferResults = Object.create(null);
   }
 
-  addDeferResolver(
+  addDeferredResult(
     path: Path | void,
     label: string,
-    responseName: string,
-    resolver: () => PromiseOrValue<mixed>,
+    typo: {|
+      defer?: {|
+        responseName: string,
+        resolver: () => PromiseOrValue<mixed>,
+      |},
+      stream?: {|
+        resolveResult: () => PromiseOrValue<mixed>,
+      |},
+    |},
   ): void {
+    const { defer, stream } = typo;
     const pathArray = pathToArray(path);
     const keyDeferResult = pathArray.toString() + label;
-    const deferResult = this.deferResults[keyDeferResult] || {
+
+    this.deferResults[keyDeferResult] = this.deferResults[keyDeferResult] || {
       resolvers: [],
       label,
       path: pathArray,
     };
-    deferResult.resolvers.push({ resolver, responseName });
-    this.deferResults[keyDeferResult] = deferResult;
+
+    if (defer) {
+      const { resolver, responseName } = defer;
+      this.deferResults[keyDeferResult].resolvers.push({
+        resolver,
+        responseName,
+      });
+    } else if (stream) {
+      this.deferResults[
+        keyDeferResult
+      ].resolveResult = (stream.resolveResult: any);
+    }
   }
 
-  addDeferResults(exeContext: ExecutionContext) {
-    const deferResultsArray = objectValues(this.deferResults);
+  resolveResults(exeContext: ExecutionContext) {
+    const deferResultsArray = objectEntries(this.deferResults);
     this.deferResults = Object.create(null);
 
     // avoid multiple resolve for same responseName in same path
     const resultsResolver = Object.create({});
-    for (const deferResult of deferResultsArray) {
-      const resolveResult = (): Promise<AsyncExecutionResult> => {
-        const { label, path, resolvers } = deferResult;
-        const results = Object.create({});
-        let containsPromise = false;
-        resolvers.forEach(({ resolver, responseName }) => {
-          const keyResultResolve = path.toString() + responseName;
-          const result = resultsResolver[keyResultResolve]
-            ? resultsResolver[keyResultResolve]
-            : resolver();
+    for (const [keyDeferResult, deferResult] of deferResultsArray) {
+      const { label, path, resolvers, resolveResult } = deferResult;
+      const resolve = resolveResult
+        ? resolveResult
+        : () => {
+            const results = Object.create({});
+            let containsPromise = false;
+            resolvers.forEach(({ resolver, responseName }) => {
+              const keyResultResolve = path.toString() + responseName;
+              const result = resultsResolver[keyResultResolve]
+                ? resultsResolver[keyResultResolve]
+                : resolver();
 
-          resultsResolver[keyResultResolve] = result;
-          if (result !== undefined) {
-            if (responseName) {
-              // defer directive
-              results[responseName] = result;
-            } else {
-              // stream directive
-              results = result;
-            }
-            if (!containsPromise && isPromise(result)) {
-              containsPromise = true;
-            }
-          }
-        });
+              resultsResolver[keyResultResolve] = result;
+              if (result !== undefined) {
+                results[responseName] = result;
+                if (!containsPromise && isPromise(result)) {
+                  containsPromise = true;
+                }
+              }
+            });
 
-        // If there are no promises, we can just return the object
-        if (!containsPromise) {
-          // deferred result must always be a Promise
-          return this.buildAsyncResponse(exeContext, Promise.resolve(results), {
-            label,
-            path,
-          });
-        }
-        // Otherwise, results is a map from field name to the result of resolving that
-        // field, which is possibly a promise. Return a promise that will return this
-        // same map, but with any promises replaced with the values they resolved to.
-        return this.buildAsyncResponse(exeContext, promiseForObject(results), {
+            // If there are no promises, we can just return the object
+            if (!containsPromise) {
+              // deferred result must always be a Promise
+              return results;
+            }
+            // Otherwise, results is a map from field name to the result of resolving that
+            // field, which is possibly a promise. Return a promise that will return this
+            // same map, but with any promises replaced with the values they resolved to.
+            return promiseForObject(results);
+          };
+
+      const result = resolve();
+
+      this.executionResults[keyDeferResult] = this.buildAsyncResponse(
+        exeContext,
+        resolve(),
+        {
           label,
           path,
-        });
-      };
-
-      this.executionResults.push(resolveResult());
+        },
+      );
     }
   }
 
@@ -238,19 +259,20 @@ class ResultResolver {
    */
   buildAsyncResponse(
     exeContext: ExecutionContext,
-    data: Promise<ObjMap<mixed> | null>,
+    data: PromiseOrValue<ObjMap<mixed> | null>,
     iterable?: {|
       label?: string,
       path?: Array<string | number>,
     |},
   ): Promise<AsyncExecutionResult> {
-    return data.then(resolved => {
+    const result = isPromise(data) ? data : Promise.resolve(data);
+    return result.then(resolved => {
       const value =
         exeContext.errors.length === 0
           ? { data: resolved, ...iterable }
           : { errors: exeContext.errors, data: resolved, ...iterable };
       // defer results are added only after the parent's response has been resolved
-      this.addDeferResults(exeContext);
+      this.resolveResults(exeContext);
       return {
         value,
         done: false,
@@ -265,27 +287,18 @@ class ResultResolver {
   buildResponse(
     exeContext: ExecutionContext,
     data: PromiseOrValue<ObjMap<mixed> | null>,
-  ): PromiseOrValue<ExecutionResult> {
+  ): PromiseOrValue<AsyncIterable<Promise<ExecutionResult>> | ExecutionResult> {
     if (isPromise(data)) {
-      return data.then(resolved => this.buildResponse(exeContext, resolved));
+      return data.then(result => {
+        return this.buildResponse(exeContext, result);
+      });
     }
-    return exeContext.errors.length === 0
-      ? { data }
-      : { errors: exeContext.errors, data };
-  }
-
-  getResult(
-    exeContext: ExecutionContext,
-    data: PromiseOrValue<ObjMap<mixed> | null>,
-  ): AsyncIterable<Promise<ExecutionResult>> | PromiseOrValue<ExecutionResult> {
     if (!Object.keys(this.deferResults).length) {
-      return this.buildResponse(exeContext, data);
+      return exeContext.errors.length === 0
+        ? { data }
+        : { errors: exeContext.errors, data };
     }
-    // deferred result must always be a Promise
-    const promiseData = isPromise(data) ? data : Promise.resolve(data);
-    this.executionResults.push(
-      this.buildAsyncResponse(exeContext, promiseData),
-    );
+    this.initialResult = this.buildAsyncResponse(exeContext, data);
     return this.getAsyncIterable();
   }
 
@@ -295,12 +308,28 @@ class ResultResolver {
       [$$asyncIterator]() {
         return {
           next() {
-            return (
-              self.executionResults.shift() ||
-              Promise.resolve({
-                done: true,
-              })
-            );
+            if (self.initialResult) {
+              return (
+                self.initialResult &&
+                self.initialResult.then(value => {
+                  self.initialResult = undefined;
+                  return value;
+                })
+              );
+            }
+            const promises = objectValues(self.executionResults);
+            if (promises.length === 0) {
+              return Promise.resolve({ value: undefined, done: true });
+            }
+            return Promise.race(promises)
+              .then(r => r)
+              .then(response => {
+                const { path, label } = response.value;
+                if (path) {
+                  delete self.executionResults[path.toString() + label];
+                }
+                return response;
+              });
           },
         };
       },
@@ -323,7 +352,7 @@ class ResultResolver {
 declare function execute(
   ExecutionArgs,
   ..._: []
-): AsyncIterable<Promise<ExecutionResult>> | PromiseOrValue<ExecutionResult>;
+): PromiseOrValue<AsyncIterable<Promise<ExecutionResult>> | ExecutionResult>;
 /* eslint-disable no-redeclare */
 declare function execute(
   schema: GraphQLSchema,
@@ -334,7 +363,7 @@ declare function execute(
   operationName?: ?string,
   fieldResolver?: ?GraphQLFieldResolver<any, any>,
   typeResolver?: ?GraphQLTypeResolver<any, any>,
-): AsyncIterable<Promise<ExecutionResult>> | PromiseOrValue<ExecutionResult>;
+): PromiseOrValue<AsyncIterable<Promise<ExecutionResult>> | ExecutionResult>;
 export function execute(
   argsOrSchema,
   document,
@@ -363,7 +392,7 @@ export function execute(
 
 function executeImpl(
   args: ExecutionArgs,
-): AsyncIterable<Promise<ExecutionResult>> | PromiseOrValue<ExecutionResult> {
+): PromiseOrValue<AsyncIterable<Promise<ExecutionResult>> | ExecutionResult> {
   const {
     schema,
     document,
@@ -404,7 +433,7 @@ function executeImpl(
   // be executed. An execution which encounters errors will still result in a
   // resolved Promise.
   const data = executeOperation(exeContext, exeContext.operation, rootValue);
-  return exeContext.resultResolver.getResult(exeContext, data);
+  return exeContext.resultResolver.buildResponse(exeContext, data);
 }
 
 /**
@@ -585,7 +614,7 @@ function executeFieldsSerially(
   );
 }
 
-function getDeferredInfo(exeContext, fieldNodes) {
+function getDeferredInfo(exeContext, fieldNodes, path) {
   let every = true;
   const deferLabels: Array<string> = [];
   for (const node of fieldNodes) {
@@ -615,20 +644,20 @@ function executeFields(
   for (const responseName of Object.keys(fields)) {
     const fieldNodes = fields[responseName];
     const fieldPath = addPath(path, responseName);
-    const [every, deferLabels] = getDeferredInfo(exeContext, fieldNodes);
+    const [every, deferLabels] = getDeferredInfo(exeContext, fieldNodes, path);
 
     const resolve = () =>
       resolveField(exeContext, parentType, sourceValue, fieldNodes, fieldPath);
 
-    const result = every ? null : resolve();
+    const result = every ? undefined : resolve(); // change null to undefined, depends on spec
 
     for (const label of deferLabels) {
-      exeContext.resultResolver.addDeferResolver(
-        path,
-        label,
-        responseName,
-        () => (every ? resolve() : result),
-      );
+      exeContext.resultResolver.addDeferredResult(path, label, {
+        defer: {
+          responseName,
+          resolver: () => (every ? resolve() : result),
+        },
+      });
     }
 
     if (result !== undefined) {
@@ -1130,27 +1159,6 @@ function completeValue(
   );
 }
 
-function getStreamInfo(exeContext, fieldNodes) {
-  const streamInfos: Array<{
-    label: string,
-    initial_count: number,
-  }> = [];
-  for (const node of fieldNodes) {
-    const lastStream = getStreamDirectiveValues(exeContext, node);
-    if (
-      lastStream &&
-      !streamInfos.some(info => info.label === lastStream.label)
-    ) {
-      // $FlowFixMe(>=0.90.0)
-      streamInfos.push({
-        label: lastStream.label,
-        initial_count: lastStream.initial_count,
-      });
-    }
-  }
-  return streamInfos;
-}
-
 /**
  * Complete a list value by completing each item in the list with the
  * inner type
@@ -1174,42 +1182,52 @@ function completeListValue(
   const itemType = returnType.ofType;
   let containsPromise = false;
   const completedResults = [];
-
-  const streamInfos = getStreamInfo(exeContext, fieldNodes);
   forEach((result: any), (item, index) => {
     // No need to modify the info object containing the path,
     // since from here on it is not ever accessed by resolver functions.
     const fieldPath = addPath(path, index);
-    const toStreamInfos = streamInfos.filter(
-      info => info.initial_count <= index,
-    );
-    const isStream = toStreamInfos.length > 0;
-    const every = isStream && toStreamInfos.length === fieldNodes.length;
-
-    const resolve = () =>
-      completeValueCatchingError(
-        exeContext,
-        itemType,
-        fieldNodes,
-        info,
-        fieldPath,
-        item,
-      );
-
-    const completedItem = !every ? resolve() : null;
-
-    for (const info of toStreamInfos) {
-      exeContext.resultResolver.addDeferResolver(
-        fieldPath,
-        info.label,
-        null,
-        () => (every ? resolve() : completedItem),
-      );
+    const initialFieldNodes = [];
+    /*
+      this loop has been fixed by taking the idea from @liliana. 
+      Unlike defer I have not found a way to avoid multiple calls to the same resolvers.
+      https://github.com/graphql/graphql-js/blob/835ae9036f9395eef2aeacbcbe7fc29b0ddd480c/src/execution/execute.js#L1075
+    */
+    for (const fieldNode of fieldNodes) {
+      const stream = getStreamDirectiveValues(exeContext, fieldNode);
+      if (
+        stream &&
+        typeof stream.label === 'string' &&
+        typeof stream.initial_count === 'number' &&
+        index >= stream.initial_count
+      ) {
+        exeContext.resultResolver.addDeferredResult(fieldPath, stream.label, {
+          stream: {
+            resolveResult: () =>
+              completeValueCatchingError(
+                exeContext,
+                itemType,
+                [fieldNode],
+                info,
+                fieldPath,
+                item,
+              ),
+          },
+        });
+      } else {
+        initialFieldNodes.push(fieldNode);
+      }
     }
-
-    if (every) {
+    if (!initialFieldNodes.length) {
       return;
     }
+    const completedItem = completeValueCatchingError(
+      exeContext,
+      itemType,
+      initialFieldNodes,
+      info,
+      fieldPath,
+      item,
+    );
 
     if (!containsPromise && isPromise(completedItem)) {
       containsPromise = true;
